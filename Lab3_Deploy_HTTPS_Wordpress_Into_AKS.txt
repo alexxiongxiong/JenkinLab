@@ -1,0 +1,143 @@
+pipeline{
+    agent {
+      label 'self-hosted'
+    }
+
+    environment {
+      AKS_Resource_Group = "cniaks"
+      AKS_Name = "cniaks"
+      ACR_LOGINSERVER = "alexrampuptest.azurecr.io"
+      Namespace_IngressController = "ingress-basic"
+      Namespace_Wordpress = "wordpress"
+    }
+
+    parameters {
+      booleanParam(name: 'Firstbuild', defaultValue: true, description: 'Is this the first build')
+}
+
+    options{
+        timestamps()
+    }
+    stages{
+        stage ('Github repo - Checkout') {
+            steps {
+                checkout scmGit(branches: [[name: '*/main']], extensions: [checkoutOption(3)], userRemoteConfigs: [[url: 'https://github.com/alexxiongxiong/wordpress/']])
+            }
+        }
+        
+        stage ('Get AKS credential') {
+            steps{
+                withCredentials([
+                    usernamePassword(
+                        credentialsId:"SP-ManageACR",
+                        usernameVariable:"aks_id",
+                        passwordVariable:"aks_passwd"
+                        )
+                    ]){
+                        sh '''
+                        az login -u ${aks_id} -p ${aks_passwd} --tenant 72f988bf-86f1-41af-91ab-2d7cd011db47 --service-principal
+                        az aks get-credentials --resource-group ${AKS_Resource_Group} --name ${AKS_Name} --admin
+                        '''
+                    }
+                }
+        }
+
+        stage ('Install wordpress in AKS') {
+            steps{
+                sh '''
+                #install wordpress
+                helm repo add azure-marketplace https://marketplace.azurecr.io/helm/v1/repo
+                helm upgrade --install wordpress azure-marketplace/wordpress --namespace ${Namespace_Wordpress} --create-namespace --set service.type=ClusterIP
+                '''
+                }
+        }
+
+        stage ('Install ingress controller in AKS') {
+            steps{
+                sh '''
+                #install ingress controller
+                helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+                helm repo update
+                helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx --namespace ${Namespace_IngressController} --create-namespace --set controller.replicaCount=2 --set controller.nodeSelector."kubernetes\\.io/os"=linux --set controller.admissionWebhooks.patch.nodeSelector."kubernetes\\.io/os"=linux --set controller.service.annotations."service\\.beta\\.kubernetes\\.io/azure-load-balancer-health-probe-request-path"=/healthz --set defaultBackend.nodeSelector."kubernetes\\.io/os"=linux
+                kubectl get services --namespace ${Namespace_IngressController} ingress-nginx-controller
+                '''
+                }
+        }
+
+        stage("Configure DNS zone"){
+            input {
+              message 'Have you configured the DNS zone?'
+              ok 'yes'
+              submitter 'xinhaoxong@microsoft.com'
+            }
+            steps{
+              echo 'DNS zone configured'
+            }
+        }
+
+        stage ('Import cert-manager image into ACR(skip if done before)') {
+            when { expression { return params.Firstbuild } }
+            environment {
+                 REGISTRY_NAME = "alexrampuptest"
+                CERT_MANAGER_REGISTRY = "quay.io"
+                CERT_MANAGER_TAG = "v1.8.0"
+                CERT_MANAGER_IMAGE_CONTROLLER = "jetstack/cert-manager-controller"
+                CERT_MANAGER_IMAGE_WEBHOOK = "jetstack/cert-manager-webhook"
+                CERT_MANAGER_IMAGE_CAINJECTOR = "jetstack/cert-manager-cainjector"
+            }
+            steps{
+                script
+                {
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') 
+                    {
+                        sh '''
+                        #Import the cert-manager images used by the Helm chart into your ACR
+                        az acr import --name ${REGISTRY_NAME} --source ${CERT_MANAGER_REGISTRY}/${CERT_MANAGER_IMAGE_CONTROLLER}:${CERT_MANAGER_TAG} --image ${CERT_MANAGER_IMAGE_CONTROLLER}:${CERT_MANAGER_TAG}
+                        az acr import --name ${REGISTRY_NAME} --source ${CERT_MANAGER_REGISTRY}/${CERT_MANAGER_IMAGE_WEBHOOK}:${CERT_MANAGER_TAG} --image ${CERT_MANAGER_IMAGE_WEBHOOK}:${CERT_MANAGER_TAG}
+                        az acr import --name ${REGISTRY_NAME} --source ${CERT_MANAGER_REGISTRY}/${CERT_MANAGER_IMAGE_CAINJECTOR}:${CERT_MANAGER_TAG} --image ${CERT_MANAGER_IMAGE_CAINJECTOR}:${CERT_MANAGER_TAG}
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage ('Install cert-manager in AKS') {
+            environment {
+                CERT_MANAGER_TAG = "v1.8.0"
+                CERT_MANAGER_IMAGE_CONTROLLER = "jetstack/cert-manager-controller"
+                CERT_MANAGER_IMAGE_WEBHOOK = "jetstack/cert-manager-webhook"
+                CERT_MANAGER_IMAGE_CAINJECTOR = "jetstack/cert-manager-cainjector"
+            }
+            steps{
+                sh '''
+                #install cert-manager
+                kubectl label namespace ${Namespace_IngressController} cert-manager.io/disable-validation=true --overwrite
+                helm repo add jetstack https://charts.jetstack.io
+                helm repo update
+                helm upgrade --install cert-manager jetstack/cert-manager --namespace ${Namespace_IngressController} --version=${CERT_MANAGER_TAG} --set installCRDs=true --set nodeSelector."kubernetes\\.io/os"=linux --set image.repository=${ACR_LOGINSERVER}/${CERT_MANAGER_IMAGE_CONTROLLER} --set image.tag=${CERT_MANAGER_TAG} --set webhook.image.repository=${ACR_LOGINSERVER}/${CERT_MANAGER_IMAGE_WEBHOOK} --set webhook.image.tag=${CERT_MANAGER_TAG} --set cainjector.image.repository=${ACR_LOGINSERVER}/${CERT_MANAGER_IMAGE_CAINJECTOR} --set cainjector.image.tag=${CERT_MANAGER_TAG}
+                
+                #Create a CA cluster issuer
+                kubectl apply -f cluster-issuer.yaml --namespace ${Namespace_IngressController}
+                '''
+                }
+        }
+        
+        stage ('deploy ingress in AKS') {
+            steps{
+                sh '''
+                #Create ingress-rules
+                kubectl apply -f ingress-wordpress.yaml --namespace ${Namespace_Wordpress}
+                '''
+                }
+        }
+    }
+        post { 
+            always { 
+                script {
+                    mail to: 'xinhaoxiong@microsoft.com',
+                    subject: "Running Pipeline: ${currentBuild.fullDisplayName}",
+                    body: "Deployment Wordpress is finished with ${env.BUILD_URL}"
+                }
+            }
+        }
+}

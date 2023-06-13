@@ -1,0 +1,54 @@
+pipeline{
+    agent {
+      label 'self-hosted'
+    }
+    environment {
+      AKS_Resource_Group = "kubenet"
+      AKS_Name = "kubenet"
+    }
+
+    options{
+        timestamps()
+    }
+    stages{
+        stage("Get avaiable AKS versions"){
+            steps{
+                withCredentials([
+                    usernamePassword(
+                        credentialsId:"SP-ManageACR",
+                        usernameVariable:"aks_username",
+                        passwordVariable:"aks_passwd"
+                        )
+                    ]){
+                        sh 'az login -u ${aks_username} -p ${aks_passwd} --tenant 72f988bf-86f1-41af-91ab-2d7cd011db47 --service-principal'
+                    }
+                sh 'az aks get-upgrades --resource-group ${AKS_Resource_Group} --name ${AKS_Name} --output table'
+            }
+        }
+        stage("Wait for approvement"){
+            input {
+              message 'Would you like to upgrade your AKS?'
+              ok 'yes'
+              submitter 'xinhaoxong@microsoft.com'
+            }
+            steps{
+              echo 'upgrade approved'
+            }
+        }
+        stage("upgrade AKS cluster"){
+            options {
+              timeout(time: 1, unit: 'HOURS')   // timeout on this stage
+            }
+            input {
+              message 'Which version would you like to upgrade?'
+              submitter 'xinhaoxiong@microsoft.com'
+              parameters {
+                string description: 'The target version to which you will be upgraded.', name: 'upgrade_target_version'
+              }
+            }
+            steps{
+              sh 'az aks upgrade --resource-group ${AKS_Resource_Group} --name ${AKS_Name} --kubernetes-version ${upgrade_target_version} --yes'
+            }
+        }
+    }
+}

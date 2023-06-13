@@ -1,0 +1,82 @@
+pipeline{
+    agent {
+      label 'self-hosted'
+    }
+    environment {
+      AKS_Resource_Group = "kubenet"
+      AKS_Name = "kubenet"
+      ACR_LOGINSERVER = "alexrampuptest.azurecr.io"
+
+    }
+    options{
+        timestamps()
+    }
+    stages{
+        stage ('webapp code - Checkout') {
+            steps {
+				checkout scmGit(branches: [[name: '*/main']], extensions: [checkoutOption(3)], userRemoteConfigs: [[url: 'https://github.com/alexxiongxiong/GoWebApp']])
+			}
+		}
+        stage ('Docker Build and Push to ACR') {
+           steps{
+                withCredentials([
+                    usernamePassword(
+                        credentialsId:"SP-ManageACR",
+                        usernameVariable:"ACR_ID",
+                        passwordVariable:"ACR_PASSWORD"
+                        )
+                    ]){
+                sh '''
+				#Azure Container Registry config
+				ACR_REPO_NAME="webapp"
+				IMAGE_NAME="$ACR_LOGINSERVER/$ACR_REPO_NAME:jenkins${BUILD_NUMBER}"
+
+
+				#Docker build and push to Azure Container Registry
+				docker build -t $IMAGE_NAME .
+				docker login $ACR_LOGINSERVER -u $ACR_ID -p $ACR_PASSWORD
+				docker push $IMAGE_NAME
+				'''
+                }
+           }
+		}
+        stage("Wait for approvement before deploying") {
+            input {
+              message 'Deploy to AKS?'
+              ok 'yes'
+              submitter 'xinhaoxong@microsoft.com'
+            }
+            steps{
+              echo 'Deploy approved'
+            }
+        }
+		
+        stage ('Deploy to AKS') {
+            steps{
+                withCredentials([
+                    usernamePassword(
+                        credentialsId:"SP-ManageACR",
+                        usernameVariable:"aks_id",
+                        passwordVariable:"aks_passwd"
+                        )
+                    ]){
+						sh '''
+						az login -u ${aks_id} -p ${aks_passwd} --tenant 72f988bf-86f1-41af-91ab-2d7cd011db47 --service-principal
+						az aks get-credentials --resource-group ${AKS_Resource_Group} --name ${AKS_Name}
+						'''
+                    }
+				
+				sh '''
+				echo "${BUILD_NUMBER}"
+				sed -i "s/<BUILD_TAG>/jenkins${BUILD_NUMBER}/" ./manifests/deployment.yaml
+				kubectl apply -f ./manifests/deployment.yaml
+				'''
+            }
+		}
+    }
+		post { 
+			always { 
+				echo 'Build Steps Completed'
+			}
+		}
+}
